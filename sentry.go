@@ -128,7 +128,7 @@ func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 
 	stConfig := &hook.StacktraceConfiguration
 	if stConfig.Enable && entry.Level <= stConfig.Level {
-		if err, ok := getAndDelError(d, logrus.ErrorKey); ok {
+		if err, ok := getError(d, logrus.ErrorKey); ok {
 			var currentStacktrace *raven.Stacktrace
 			if stacktracer, ok := err.(Stacktracer); ok {
 				currentStacktrace = stacktracer.GetStacktrace()
@@ -137,7 +137,6 @@ func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 			}
 			exc := raven.NewException(err, currentStacktrace)
 			packet.Interfaces = append(packet.Interfaces, exc)
-			packet.Culprit = err.Error()
 		} else {
 			currentStacktrace := raven.NewStacktrace(stConfig.Skip, stConfig.Context, stConfig.InAppPrefixes)
 			packet.Interfaces = append(packet.Interfaces, currentStacktrace)
@@ -238,11 +237,11 @@ func getAndDelString(d logrus.Fields, key string) (string, bool) {
 	return "", false
 }
 
-func getAndDelError(d logrus.Fields, key string) (error, bool) {
+func getError(d logrus.Fields, key string) (error, bool) {
 	if value, ok := d[key].(error); ok {
-		delete(d, key)
 		return value, true
 	}
+
 	return nil, false
 }
 
