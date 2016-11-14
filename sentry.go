@@ -104,6 +104,8 @@ func NewWithClientSentryHook(client *raven.Client, levels []logrus.Level) (*Sent
 func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 
 	packet := raven.NewPacket(entry.Message)
+	packet.Culprit = entry.Message
+
 	packet.Timestamp = raven.Timestamp(entry.Time)
 	packet.Level = severityMap[entry.Level]
 	packet.Platform = "go"
