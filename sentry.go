@@ -111,7 +111,7 @@ func NewWithClientSentryHook(client *raven.Client, levels []logrus.Level) (*Sent
 // Special fields that sentry uses to give more information to the server
 // are extracted from entry.Data (if they are found)
 // These fields include:
-// 		error, logger, server_name, http_request, tags, user
+// 		event_id, error, logger, server_name, http_request, tags, user
 //		user_name, user_email, user_id, user_ip
 func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 	packet := raven.NewPacket(entry.Message)

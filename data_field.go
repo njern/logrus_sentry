@@ -106,6 +106,8 @@ func (d *dataField) getUser() (*raven.User, bool) {
 		}
 	}
 
+	// If _fieldUser_ is not set as a root object, check
+	// if the fields have been set directly
 	username, _ := data["user_name"].(string)
 	email, _ := data["user_email"].(string)
 	id, _ := data["user_id"].(string)
