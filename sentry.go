@@ -110,9 +110,12 @@ func NewWithClientSentryHook(client *raven.Client, levels []logrus.Level) (*Sent
 // Fire is called when an event should be sent to sentry
 // Special fields that sentry uses to give more information to the server
 // are extracted from entry.Data (if they are found)
-// These fields are: error, logger, server_name, http_request, tags
+// These fields include:
+// 		error, logger, server_name, http_request, tags, user
+//		user_name, user_email, user_id, user_ip
 func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 	packet := raven.NewPacket(entry.Message)
+	packet.Culprit = entry.Message
 	packet.Timestamp = raven.Timestamp(entry.Time)
 	packet.Level = severityMap[entry.Level]
 	packet.Platform = "go"
@@ -123,18 +126,23 @@ func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 	if logger, ok := df.getLogger(); ok {
 		packet.Logger = logger
 	}
+
 	if serverName, ok := df.getServerName(); ok {
 		packet.ServerName = serverName
 	}
+
 	if eventID, ok := df.getEventID(); ok {
 		packet.EventID = eventID
 	}
+
 	if tags, ok := df.getTags(); ok {
 		packet.Tags = tags
 	}
+
 	if req, ok := df.getHTTPRequest(); ok {
 		packet.Interfaces = append(packet.Interfaces, raven.NewHttp(req))
 	}
+
 	if user, ok := df.getUser(); ok {
 		packet.Interfaces = append(packet.Interfaces, user)
 	}
@@ -148,9 +156,9 @@ func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 			if currentStacktrace == nil {
 				currentStacktrace = raven.NewStacktrace(stConfig.Skip, stConfig.Context, stConfig.InAppPrefixes)
 			}
+
 			exc := raven.NewException(err, currentStacktrace)
 			packet.Interfaces = append(packet.Interfaces, exc)
-			packet.Culprit = err.Error()
 		} else {
 			currentStacktrace := raven.NewStacktrace(stConfig.Skip, stConfig.Context, stConfig.InAppPrefixes)
 			packet.Interfaces = append(packet.Interfaces, currentStacktrace)

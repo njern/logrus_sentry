@@ -44,7 +44,7 @@ type uuid []byte
 // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx and
 // urn:uuid:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx are decoded.
 func parseUUID(s string) uuid {
-	//If it is in no dash format "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+	// If it is in no dash format "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 	if len(s) == 32 {
 		uuid := make([]byte, 16)
 		for i, x := range []int{

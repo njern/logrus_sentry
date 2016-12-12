@@ -83,7 +83,7 @@ func (d *dataField) getEventID() (string, bool) {
 		return "", false
 	}
 
-	//verify eventID is 32 characters hexadecimal string (UUID4)
+	// verify eventID is 32 characters hexadecimal string (UUID4)
 	uuid := parseUUID(eventID)
 	if uuid == nil {
 		return "", false

@@ -21,9 +21,9 @@ import (
 )
 
 const (
-	message     = "error message"
-	server_name = "testserver.internal"
-	logger_name = "test.logger"
+	message    = "error message"
+	serverName = "testserver.internal"
+	loggerName = "test.logger"
 )
 
 func getTestLogger() *logrus.Logger {
@@ -87,18 +87,18 @@ func TestSpecialFields(t *testing.T) {
 
 		req, _ := http.NewRequest("GET", "url", nil)
 		logger.WithFields(logrus.Fields{
-			"server_name":  server_name,
-			"logger":       logger_name,
+			"server_name":  serverName,
+			"logger":       loggerName,
 			"http_request": req,
 		}).Error(message)
 
 		packet := <-pch
-		if packet.Logger != logger_name {
-			t.Errorf("logger should have been %s, was %s", logger_name, packet.Logger)
+		if packet.Logger != loggerName {
+			t.Errorf("logger should have been %s, was %s", loggerName, packet.Logger)
 		}
 
-		if packet.ServerName != server_name {
-			t.Errorf("server_name should have been %s, was %s", server_name, packet.ServerName)
+		if packet.ServerName != serverName {
+			t.Errorf("server_name should have been %s, was %s", serverName, packet.ServerName)
 		}
 	})
 }
