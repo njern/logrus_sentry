@@ -3,11 +3,12 @@ package logrus_sentry
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
+	"runtime"
 	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/getsentry/raven-go"
+	"github.com/pkg/errors"
 )
 
 var (
@@ -36,8 +37,17 @@ type SentryHook struct {
 	extraFilters map[string]func(interface{}) interface{}
 }
 
+// The Stacktracer interface allows an error type to return a raven.Stacktrace.
 type Stacktracer interface {
 	GetStacktrace() *raven.Stacktrace
+}
+
+type causer interface {
+	Cause() error
+}
+
+type pkgErrorStackTracer interface {
+	StackTrace() errors.StackTrace
 }
 
 // StackTraceConfiguration allows for configuring stacktraces
@@ -100,52 +110,55 @@ func NewWithClientSentryHook(client *raven.Client, levels []logrus.Level) (*Sent
 // Fire is called when an event should be sent to sentry
 // Special fields that sentry uses to give more information to the server
 // are extracted from entry.Data (if they are found)
-// These fields are: error, logger, server_name and http_request
+// These fields are: error, logger, server_name, http_request, tags
 func (hook *SentryHook) Fire(entry *logrus.Entry) error {
-
 	packet := raven.NewPacket(entry.Message)
-	packet.Culprit = entry.Message
-
 	packet.Timestamp = raven.Timestamp(entry.Time)
 	packet.Level = severityMap[entry.Level]
 	packet.Platform = "go"
 
-	d := entry.Data
+	df := newDataField(entry.Data)
 
-	if logger, ok := getAndDelString(d, "logger"); ok {
+	// set special fields
+	if logger, ok := df.getLogger(); ok {
 		packet.Logger = logger
 	}
-	if serverName, ok := getAndDelString(d, "server_name"); ok {
+	if serverName, ok := df.getServerName(); ok {
 		packet.ServerName = serverName
 	}
-	if req, ok := getAndDelRequest(d, "http_request"); ok {
-		packet.Interfaces = append(packet.Interfaces, raven.NewHttp(req))
-	}
-	if user, ok := getUserContext(d); ok {
-		packet.Interfaces = append(packet.Interfaces, user)
-	}
-	if eventID, ok := getEventID(d); ok {
+	if eventID, ok := df.getEventID(); ok {
 		packet.EventID = eventID
 	}
+	if tags, ok := df.getTags(); ok {
+		packet.Tags = tags
+	}
+	if req, ok := df.getHTTPRequest(); ok {
+		packet.Interfaces = append(packet.Interfaces, raven.NewHttp(req))
+	}
+	if user, ok := df.getUser(); ok {
+		packet.Interfaces = append(packet.Interfaces, user)
+	}
 
+	// set stacktrace data
 	stConfig := &hook.StacktraceConfiguration
 	if stConfig.Enable && entry.Level <= stConfig.Level {
-		if err, ok := getError(d, logrus.ErrorKey); ok {
+		if err, ok := df.getError(); ok {
 			var currentStacktrace *raven.Stacktrace
-			if stacktracer, ok := err.(Stacktracer); ok {
-				currentStacktrace = stacktracer.GetStacktrace()
-			} else {
+			currentStacktrace, err = hook.findStacktraceAndCause(err)
+			if currentStacktrace == nil {
 				currentStacktrace = raven.NewStacktrace(stConfig.Skip, stConfig.Context, stConfig.InAppPrefixes)
 			}
 			exc := raven.NewException(err, currentStacktrace)
 			packet.Interfaces = append(packet.Interfaces, exc)
+			packet.Culprit = err.Error()
 		} else {
 			currentStacktrace := raven.NewStacktrace(stConfig.Skip, stConfig.Context, stConfig.InAppPrefixes)
 			packet.Interfaces = append(packet.Interfaces, currentStacktrace)
 		}
 	}
 
-	dataExtra := hook.formatExtraData(d)
+	// set other fields
+	dataExtra := hook.formatExtraData(df)
 	if packet.Extra == nil {
 		packet.Extra = dataExtra
 	} else {
@@ -168,9 +181,59 @@ func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 	return nil
 }
 
+func (hook *SentryHook) findStacktraceAndCause(err error) (*raven.Stacktrace, error) {
+	errCause := errors.Cause(err)
+	var stacktrace *raven.Stacktrace
+	var stackErr errors.StackTrace
+	for err != nil {
+		// Find the earliest *raven.Stacktrace, or error.StackTrace
+		if tracer, ok := err.(Stacktracer); ok {
+			stacktrace = tracer.GetStacktrace()
+			stackErr = nil
+		} else if tracer, ok := err.(pkgErrorStackTracer); ok {
+			stacktrace = nil
+			stackErr = tracer.StackTrace()
+		}
+		if cause, ok := err.(causer); ok {
+			err = cause.Cause()
+		} else {
+			break
+		}
+	}
+	if stackErr != nil {
+		stacktrace = hook.convertStackTrace(stackErr)
+	}
+	return stacktrace, errCause
+}
+
+// convertStackTrace converts an errors.StackTrace into a natively consumable
+// *raven.Stacktrace
+func (hook *SentryHook) convertStackTrace(st errors.StackTrace) *raven.Stacktrace {
+	stConfig := &hook.StacktraceConfiguration
+	stFrames := []errors.Frame(st)
+	frames := make([]*raven.StacktraceFrame, 0, len(stFrames))
+	for i := range stFrames {
+		pc := uintptr(stFrames[i])
+		fn := runtime.FuncForPC(pc)
+		file, line := fn.FileLine(pc)
+		frames = append(frames, raven.NewStacktraceFrame(pc, file, line, stConfig.Context, stConfig.InAppPrefixes))
+	}
+	return &raven.Stacktrace{Frames: frames}
+}
+
 // Levels returns the available logging levels.
 func (hook *SentryHook) Levels() []logrus.Level {
 	return hook.levels
+}
+
+// SetRelease sets release tag.
+func (hook *SentryHook) SetRelease(release string) {
+	hook.client.SetRelease(release)
+}
+
+// SetEnvironment sets environment tag.
+func (hook *SentryHook) SetEnvironment(environment string) {
+	hook.client.SetEnvironment(environment)
 }
 
 // AddIgnore adds field name to ignore.
@@ -183,13 +246,17 @@ func (hook *SentryHook) AddExtraFilter(name string, fn func(interface{}) interfa
 	hook.extraFilters[name] = fn
 }
 
-func (hook *SentryHook) formatExtraData(fields logrus.Fields) (result map[string]interface{}) {
+func (hook *SentryHook) formatExtraData(df *dataField) (result map[string]interface{}) {
 	// create a map for passing to Sentry's extra data
-	result = make(map[string]interface{}, len(fields))
-	for k, v := range fields {
+	result = make(map[string]interface{}, df.len())
+	for k, v := range df.data {
+		if df.isOmit(k) {
+			continue // skip already used special fields
+		}
 		if _, ok := hook.ignoreFields[k]; ok {
 			continue
 		}
+
 		if fn, ok := hook.extraFilters[k]; ok {
 			v = fn(v) // apply custom filter
 		} else {
@@ -212,73 +279,4 @@ func formatData(value interface{}) (formatted interface{}) {
 	default:
 		return value
 	}
-}
-
-func getEventID(d logrus.Fields) (string, bool) {
-	eventID, ok := d["event_id"].(string)
-
-	if !ok {
-		return "", false
-	}
-
-	//verify eventID is 32 characters hexadecimal string (UUID4)
-	uuid := parseUUID(eventID)
-
-	if uuid == nil {
-		return "", false
-	}
-
-	return uuid.noDashString(), true
-}
-
-func getAndDelString(d logrus.Fields, key string) (string, bool) {
-	if value, ok := d[key].(string); ok {
-		delete(d, key)
-		return value, true
-	}
-	return "", false
-}
-
-func getError(d logrus.Fields, key string) (error, bool) {
-	if value, ok := d[key].(error); ok {
-		return value, true
-	}
-
-	return nil, false
-}
-
-func getAndDelRequest(d logrus.Fields, key string) (*http.Request, bool) {
-	if value, ok := d[key].(*http.Request); ok {
-		delete(d, key)
-		return value, true
-	}
-	return nil, false
-}
-
-func getUserContext(d logrus.Fields) (*raven.User, bool) {
-	if v, ok := d["user"]; ok {
-		switch val := v.(type) {
-		case *raven.User:
-			return val, true
-
-		case raven.User:
-			return &val, true
-		}
-	}
-
-	username, _ := d["user_name"].(string)
-	email, _ := d["user_email"].(string)
-	id, _ := d["user_id"].(string)
-	ip, _ := d["user_ip"].(string)
-
-	if username == "" && email == "" && id == "" && ip == "" {
-		return nil, false
-	}
-
-	return &raven.User{
-		ID:       id,
-		Username: username,
-		Email:    email,
-		IP:       ip,
-	}, true
 }
