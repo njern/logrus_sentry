@@ -9,6 +9,7 @@ import (
 
 const (
 	fieldEventID     = "event_id"
+	fieldFingerprint = "fingerprint"
 	fieldLogger      = "logger"
 	fieldServerName  = "server_name"
 	fieldTags        = "tags"
@@ -61,6 +62,14 @@ func (d *dataField) getTags() (raven.Tags, bool) {
 	return nil, false
 }
 
+func (d *dataField) getFingerprint() ([]string, bool) {
+	if fingerprint, ok := d.data[fieldFingerprint].([]string); ok {
+		d.omitList[fieldFingerprint] = struct{}{}
+		return fingerprint, true
+	}
+	return nil, false
+}
+
 func (d *dataField) getError() (error, bool) {
 	if err, ok := d.data[logrus.ErrorKey].(error); ok {
 		d.omitList[logrus.ErrorKey] = struct{}{}
@@ -69,8 +78,12 @@ func (d *dataField) getError() (error, bool) {
 	return nil, false
 }
 
-func (d *dataField) getHTTPRequest() (*http.Request, bool) {
+func (d *dataField) getHTTPRequest() (*raven.Http, bool) {
 	if req, ok := d.data[fieldHTTPRequest].(*http.Request); ok {
+		d.omitList[fieldHTTPRequest] = struct{}{}
+		return raven.NewHttp(req), true
+	}
+	if req, ok := d.data[fieldHTTPRequest].(*raven.Http); ok {
 		d.omitList[fieldHTTPRequest] = struct{}{}
 		return req, true
 	}

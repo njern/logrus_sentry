@@ -170,7 +170,32 @@ func TestSentryTags(t *testing.T) {
 			},
 		}
 		if !reflect.DeepEqual(packet.Tags, expected) {
-			t.Errorf("message should have been %s, was %s", message, packet.Message)
+			t.Errorf("tags should have been %+v, was %+v", expected, packet.Tags)
+		}
+	})
+}
+
+func TestSentryFingerprint(t *testing.T) {
+	WithTestDSN(t, func(dsn string, pch <-chan *resultPacket) {
+		logger := getTestLogger()
+		levels := []logrus.Level{
+			logrus.ErrorLevel,
+		}
+		fingerprint := []string{"fingerprint"}
+
+		hook, err := NewSentryHook(dsn, levels)
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+
+		logger.Hooks.Add(hook)
+
+		logger.WithFields(logrus.Fields{
+			"fingerprint": fingerprint,
+		}).Error(message)
+		packet := <-pch
+		if !reflect.DeepEqual(packet.Fingerprint, fingerprint) {
+			t.Errorf("fingerprint should have been %v, was %v", fingerprint, packet.Fingerprint)
 		}
 	})
 }
@@ -197,8 +222,7 @@ func TestSentryStacktrace(t *testing.T) {
 		hook.StacktraceConfiguration.Enable = true
 
 		logger.Error(message) // this is the call that the last frame of stacktrace should capture
-		expectedLineno := 199 //this should be the line number of the previous line
-
+		expectedLineno := 224 //this should be the line number of the previous line
 		packet = <-pch
 		stacktraceSize = len(packet.Stacktrace.Frames)
 		if stacktraceSize == 0 {
@@ -263,8 +287,8 @@ func TestSentryStacktrace(t *testing.T) {
 		if packet.Exception.Stacktrace != nil {
 			frames = packet.Exception.Stacktrace.Frames
 		}
-		expectedPkgErrorsStackTraceFilename := "github.com/evalphobia/logrus_sentry/sentry_test.go"
-		expectedFrameCount := 5
+		expectedPkgErrorsStackTraceFilename := "testing/testing.go"
+		expectedFrameCount := 4
 		expectedCulprit = "errorX"
 		if packet.Culprit != expectedCulprit {
 			t.Errorf("Expected culprit of '%s', got '%s'", expectedCulprit, packet.Culprit)
@@ -272,7 +296,7 @@ func TestSentryStacktrace(t *testing.T) {
 		if len(frames) != expectedFrameCount {
 			t.Errorf("Expected %d frames, got %d", expectedFrameCount, len(frames))
 		}
-		if frames[0].Filename != expectedPkgErrorsStackTraceFilename {
+		if !strings.HasSuffix(frames[0].Filename, expectedPkgErrorsStackTraceFilename) {
 			t.Error("Stacktrace should be taken from err if it implements the pkgErrorStackTracer interface")
 		}
 	})
@@ -448,5 +472,20 @@ func (myStacktracerError) GetStacktrace() *raven.Stacktrace {
 		Frames: []*raven.StacktraceFrame{
 			{Filename: expectedStackFrameFilename},
 		},
+	}
+}
+
+func TestConvertStackTrace(t *testing.T) {
+	hook := SentryHook{}
+	expected := raven.NewStacktrace(0, 0, nil)
+	st := pkgerrors.New("-").(pkgErrorStackTracer).StackTrace()
+	ravenSt := hook.convertStackTrace(st)
+
+	// Obscure the line numbes, so DeepEqual doesn't fail erroneously
+	for _, frame := range append(expected.Frames, ravenSt.Frames...) {
+		frame.Lineno = 999
+	}
+	if !reflect.DeepEqual(ravenSt, expected) {
+		t.Error("stack traces differ")
 	}
 }

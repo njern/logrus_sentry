@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/Sirupsen/logrus"
@@ -22,6 +23,11 @@ var (
 	}
 )
 
+// BufSize controls the number of logs that can be in progress before logging
+// will start blocking. Set logrus_sentry.BufSize = <value> _before_ calling
+// NewAsync*().
+var BufSize uint = 8192
+
 // SentryHook delivers logs to a sentry server.
 type SentryHook struct {
 	// Timeout sets the time to wait for a delivery error from the sentry server.
@@ -35,6 +41,11 @@ type SentryHook struct {
 
 	ignoreFields map[string]struct{}
 	extraFilters map[string]func(interface{}) interface{}
+
+	asynchronous bool
+	buf          chan *raven.Packet
+	wg           sync.WaitGroup
+	mu           sync.RWMutex
 }
 
 // The Stacktracer interface allows an error type to return a raven.Stacktrace.
@@ -107,15 +118,46 @@ func NewWithClientSentryHook(client *raven.Client, levels []logrus.Level) (*Sent
 	}, nil
 }
 
+// NewAsyncSentryHook creates a hook same as NewSentryHook, but in asynchronous
+// mode. This method sets the timeout to 1000 milliseconds.
+func NewAsyncSentryHook(DSN string, levels []logrus.Level) (*SentryHook, error) {
+	hook, err := NewSentryHook(DSN, levels)
+	return setAsync(hook), err
+}
+
+// NewAsyncWithTagsSentryHook creates a hook same as NewWithTagsSentryHook, but
+// in asynchronous mode. This method sets the timeout to 1000 milliseconds.
+func NewAsyncWithTagsSentryHook(DSN string, tags map[string]string, levels []logrus.Level) (*SentryHook, error) {
+	hook, err := NewWithTagsSentryHook(DSN, tags, levels)
+	return setAsync(hook), err
+}
+
+// NewAsyncWithClientSentryHook creates a hook same as NewWithClientSentryHook,
+// but in asynchronous mode. This method sets the timeout to 1000 milliseconds.
+func NewAsyncWithClientSentryHook(client *raven.Client, levels []logrus.Level) (*SentryHook, error) {
+	hook, err := NewWithClientSentryHook(client, levels)
+	return setAsync(hook), err
+}
+
+func setAsync(hook *SentryHook) *SentryHook {
+	if hook == nil {
+		return nil
+	}
+	hook.Timeout = 1 * time.Second
+	hook.asynchronous = true
+	hook.buf = make(chan *raven.Packet, BufSize)
+	go hook.fire() // Log in background
+	return hook
+}
+
 // Fire is called when an event should be sent to sentry
 // Special fields that sentry uses to give more information to the server
 // are extracted from entry.Data (if they are found)
-// These fields include:
-// 		event_id, error, logger, server_name, http_request, tags, user
-//		user_name, user_email, user_id, user_ip
+// These fields are: error, logger, server_name, http_request, tags
 func (hook *SentryHook) Fire(entry *logrus.Entry) error {
+	hook.mu.RLock() // Allow multiple go routines to log simultaneously
+	defer hook.mu.RUnlock()
 	packet := raven.NewPacket(entry.Message)
-	packet.Culprit = entry.Message
 	packet.Timestamp = raven.Timestamp(entry.Time)
 	packet.Level = severityMap[entry.Level]
 	packet.Platform = "go"
@@ -126,23 +168,21 @@ func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 	if logger, ok := df.getLogger(); ok {
 		packet.Logger = logger
 	}
-
 	if serverName, ok := df.getServerName(); ok {
 		packet.ServerName = serverName
 	}
-
 	if eventID, ok := df.getEventID(); ok {
 		packet.EventID = eventID
 	}
-
 	if tags, ok := df.getTags(); ok {
 		packet.Tags = tags
 	}
-
-	if req, ok := df.getHTTPRequest(); ok {
-		packet.Interfaces = append(packet.Interfaces, raven.NewHttp(req))
+	if fingerprint, ok := df.getFingerprint(); ok {
+		packet.Fingerprint = fingerprint
 	}
-
+	if req, ok := df.getHTTPRequest(); ok {
+		packet.Interfaces = append(packet.Interfaces, req)
+	}
 	if user, ok := df.getUser(); ok {
 		packet.Interfaces = append(packet.Interfaces, user)
 	}
@@ -152,13 +192,14 @@ func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 	if stConfig.Enable && entry.Level <= stConfig.Level {
 		if err, ok := df.getError(); ok {
 			var currentStacktrace *raven.Stacktrace
-			currentStacktrace, err = hook.findStacktraceAndCause(err)
+			currentStacktrace = hook.findStacktrace(err)
 			if currentStacktrace == nil {
 				currentStacktrace = raven.NewStacktrace(stConfig.Skip, stConfig.Context, stConfig.InAppPrefixes)
 			}
-
+			err := errors.Cause(err)
 			exc := raven.NewException(err, currentStacktrace)
 			packet.Interfaces = append(packet.Interfaces, exc)
+			packet.Culprit = err.Error()
 		} else {
 			currentStacktrace := raven.NewStacktrace(stConfig.Skip, stConfig.Context, stConfig.InAppPrefixes)
 			packet.Interfaces = append(packet.Interfaces, currentStacktrace)
@@ -175,6 +216,37 @@ func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 		}
 	}
 
+	if hook.asynchronous {
+		hook.wg.Add(1)
+		hook.buf <- packet
+		return nil
+	}
+	return hook.sendPacket(packet)
+}
+
+func (hook *SentryHook) fire() {
+	for {
+		packet := <-hook.buf
+		if err := hook.sendPacket(packet); err != nil {
+			fmt.Println(err)
+		}
+		hook.wg.Done()
+	}
+}
+
+// Flush waits for the log queue to empty. This function only does anything in
+// asynchronous mode.
+func (hook *SentryHook) Flush() {
+	if !hook.asynchronous {
+		return
+	}
+	hook.mu.Lock() // Claim exclusive access; any logging goroutines will block until the flush completes
+	defer hook.mu.Unlock()
+
+	hook.wg.Wait()
+}
+
+func (hook *SentryHook) sendPacket(packet *raven.Packet) error {
 	_, errCh := hook.client.Capture(packet, nil)
 	timeout := hook.Timeout
 	if timeout != 0 {
@@ -189,8 +261,7 @@ func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 	return nil
 }
 
-func (hook *SentryHook) findStacktraceAndCause(err error) (*raven.Stacktrace, error) {
-	errCause := errors.Cause(err)
+func (hook *SentryHook) findStacktrace(err error) *raven.Stacktrace {
 	var stacktrace *raven.Stacktrace
 	var stackErr errors.StackTrace
 	for err != nil {
@@ -211,7 +282,7 @@ func (hook *SentryHook) findStacktraceAndCause(err error) (*raven.Stacktrace, er
 	if stackErr != nil {
 		stacktrace = hook.convertStackTrace(stackErr)
 	}
-	return stacktrace, errCause
+	return stacktrace
 }
 
 // convertStackTrace converts an errors.StackTrace into a natively consumable
@@ -224,7 +295,15 @@ func (hook *SentryHook) convertStackTrace(st errors.StackTrace) *raven.Stacktrac
 		pc := uintptr(stFrames[i])
 		fn := runtime.FuncForPC(pc)
 		file, line := fn.FileLine(pc)
-		frames = append(frames, raven.NewStacktraceFrame(pc, file, line, stConfig.Context, stConfig.InAppPrefixes))
+		frame := raven.NewStacktraceFrame(pc, file, line, stConfig.Context, stConfig.InAppPrefixes)
+		if frame != nil {
+			frames = append(frames, frame)
+		}
+	}
+
+	// Sentry wants the frames with the oldest first, so reverse them
+	for i, j := 0, len(frames)-1; i < j; i, j = i+1, j-1 {
+		frames[i], frames[j] = frames[j], frames[i]
 	}
 	return &raven.Stacktrace{Frames: frames}
 }
