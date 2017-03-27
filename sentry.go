@@ -182,7 +182,10 @@ func (hook *SentryHook) Fire(entry *logrus.Entry) error {
 	}
 	if req, ok := df.getHTTPRequest(); ok {
 		packet.Interfaces = append(packet.Interfaces, req)
+		// Consume the HTTP request
+		delete(entry.Data, fieldHTTPRequest)
 	}
+
 	if user, ok := df.getUser(); ok {
 		packet.Interfaces = append(packet.Interfaces, user)
 	}
